@@ -9,6 +9,10 @@ Usage:
   PYTHONPATH=/workspace/FlagGems-vllm/src \
   /workspace/gemms_env/bin/python tools/benchmark_flash_mla.py --warmup 5 --iter 20
 
+  # Peak long-KV sweep:
+  PYTHONPATH=/workspace/FlagGems-vllm/src \
+  /workspace/gemms_env/bin/python tools/benchmark_flash_mla.py --mode peak --skip-triton --warmup 3 --iter 10
+
   # Prefill (--mode prefill):
   PYTHONPATH=/workspace/FlagGems-vllm/src \
   /workspace/gemms_env/bin/python tools/benchmark_flash_mla.py --warmup 5 --iter 20 --mode prefill
@@ -288,6 +292,37 @@ def format_ratio(v) -> str:
     return f"{v:10.3f}x"
 
 
+def format_tflops(v) -> str:
+    if isinstance(v, str):
+        return f"{v:>12}"
+    return f"{v:11.2f}"
+
+
+def _human_int(n: int) -> str:
+    if n % (1024 * 1024) == 0:
+        return f"{n // (1024 * 1024)}M"
+    if n % 1024 == 0:
+        return f"{n // 1024}K"
+    return str(n)
+
+
+def _nominal_tflops(lat_ms, batch: int, s_kv: int, s_q: int, h_q: int, d_qk: int, dv: int = 512):
+    if isinstance(lat_ms, str) or lat_ms <= 0:
+        return "NaN"
+    flops = 2 * batch * s_q * h_q * s_kv * (d_qk + dv)
+    return flops / lat_ms / 1e9
+
+
+def _parse_peak_shape(value: str) -> tuple[int, int]:
+    try:
+        batch_s, skv_s = value.split(":", 1)
+        return int(batch_s), int(skv_s)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected B:S_KV, for example 16:2097152, got {value!r}"
+        ) from exc
+
+
 def _print_table(header: str, rows: list):
     print(header)
     print("-" * len(header))
@@ -300,11 +335,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iter", type=int, default=20)
-    parser.add_argument("--mode", choices=("decode", "prefill", "single"), default="decode")
+    parser.add_argument("--mode", choices=("decode", "prefill", "single", "peak"), default="decode")
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--s-kv", type=int, default=4096)
     parser.add_argument("--h-q", type=int, default=128)
     parser.add_argument("--d-qk", type=int, default=576)
+    parser.add_argument("--peak-shape", action="append", type=_parse_peak_shape, default=None,
+                        help=("Long-KV peak shape as B:S_KV. Can be repeated. "
+                              "Default for --mode peak: 16:2097152, 32:2097152, 8:8388608"))
     parser.add_argument("--bench-flow", choices=("full", "run-only", "split"), default="full",
                         help=("full: current single-call benchmark; run-only: prime metadata "
                               "outside timing and benchmark only repeated run; split: also "
@@ -319,14 +357,30 @@ def main() -> None:
         s_q = 1
         h_q = ns.h_q
         d_qk = ns.d_qk
+        shape_pairs = [(ns.batch, ns.s_kv)]
     elif ns.mode == "decode":
-        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
         s_kv_list = [4096, 8192, 32768]
         s_q = 1
+        shape_pairs = [(b, s_kv) for b in batch_sizes for s_kv in s_kv_list]
+    elif ns.mode == "peak":
+        shape_pairs = ns.peak_shape or [
+            (2, 2 * 1024 * 1024),
+            (4, 2 * 1024 * 1024),
+            (8, 2 * 1024 * 1024),
+            (2, 4 * 1024 * 1024),
+            (2, 8 * 1024 * 1024),
+            (4, 4 * 1024 * 1024),
+            (1, 8 * 1024 * 1024),
+        ]
+        batch_sizes = []
+        s_kv_list = []
+        s_q = 1
     else:
-        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
         s_kv_list = [4096, 8192, 32768]
         s_q = 4096
+        shape_pairs = [(b, s_kv) for b in batch_sizes for s_kv in s_kv_list]
 
     if ns.mode != "single":
         h_q = 128
@@ -372,8 +426,7 @@ def main() -> None:
             pass
         _reset_triton_allocator()
 
-    for batch in batch_sizes:
-        for s_kv in s_kv_list:
+    for batch, s_kv in shape_pairs:
             if fatal_cuda_error:
                 break
             _safe_del_cleanup()
@@ -501,9 +554,8 @@ def main() -> None:
             print(f"  batch={batch:3d} s_kv={s_kv:5d} "
                   f"vLLM={format_val(lat_vllm)} Triton={format_val(lat_triton)} TLE={format_val(lat_tle)}",
                   file=sys.stderr)
-        if fatal_cuda_error:
-            print("  Stopping after CUDA error; CUDA context is no longer reliable.", file=sys.stderr)
-            break
+    if fatal_cuda_error:
+        print("  Stopping after CUDA error; CUDA context is no longer reliable.", file=sys.stderr)
 
     if not all_results:
         print("No successful results.", file=sys.stderr)
@@ -587,10 +639,20 @@ def main() -> None:
         return
 
     # --- Print table ---
-    if ns.skip_triton:
+    if ns.skip_triton and ns.mode == "peak":
+        header = (f"{'batch':>6}  {'s_kv':>8}  {'s_q':>4}  {'h_q':>4}  {'d_qk':>4}  "
+                  f"{'vLLM(ms)':>10}  {'TLE(ms)':>10}  "
+                  f"{'vLLM TFLOPS':>12}  {'TLE TFLOPS':>12}  "
+                  f"{'TLE/vLLM':>11}")
+    elif ns.skip_triton:
         header = (f"{'batch':>6}  {'s_kv':>6}  {'s_q':>4}  {'h_q':>4}  {'d_qk':>4}  "
                   f"{'vLLM(ms)':>10}  {'TLE(ms)':>10}  "
                   f"{'TLE/vLLM':>11}")
+    elif ns.mode == "peak":
+        header = (f"{'batch':>6}  {'s_kv':>8}  {'s_q':>4}  {'h_q':>4}  {'d_qk':>4}  "
+                  f"{'vLLM(ms)':>10}  {'Triton(ms)':>10}  {'TLE(ms)':>10}  "
+                  f"{'vLLM TFLOPS':>12}  {'TLE TFLOPS':>12}  "
+                  f"{'Triton/vLLM':>11}  {'TLE/vLLM':>11}  {'TLE/Triton':>11}")
     else:
         header = (f"{'batch':>6}  {'s_kv':>6}  {'s_q':>4}  {'h_q':>4}  {'d_qk':>4}  "
                   f"{'vLLM(ms)':>10}  {'Triton(ms)':>10}  {'TLE(ms)':>10}  "
@@ -603,15 +665,31 @@ def main() -> None:
         if ns.skip_triton:
             vals = [format_val(v) for v in [batch, s_kv, s_q, h_q, d_qk, lat_vllm, lat_tle]]
             ratios = [format_ratio(v) for v in [tle_vs_vllm]]
-            rows.append(f"{batch:6d}  {s_kv:6d}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
-                        f"{vals[5]}  {vals[6]}  "
-                        f"{ratios[0]}")
+            if ns.mode == "peak":
+                vllm_tflops = _nominal_tflops(lat_vllm, batch, s_kv, s_q, h_q, d_qk)
+                tle_tflops = _nominal_tflops(lat_tle, batch, s_kv, s_q, h_q, d_qk)
+                rows.append(f"{batch:6d}  {_human_int(s_kv):>8}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
+                            f"{vals[5]}  {vals[6]}  "
+                            f"{format_tflops(vllm_tflops)}  {format_tflops(tle_tflops)}  "
+                            f"{ratios[0]}")
+            else:
+                rows.append(f"{batch:6d}  {s_kv:6d}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
+                            f"{vals[5]}  {vals[6]}  "
+                            f"{ratios[0]}")
         else:
             vals = [format_val(v) for v in [batch, s_kv, s_q, h_q, d_qk, lat_vllm, lat_triton, lat_tle]]
             ratios = [format_ratio(v) for v in [triton_vs_vllm, tle_vs_vllm, tle_vs_triton]]
-            rows.append(f"{batch:6d}  {s_kv:6d}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
-                        f"{vals[5]}  {vals[6]}  {vals[7]}  "
-                        f"{ratios[0]}  {ratios[1]}  {ratios[2]}")
+            if ns.mode == "peak":
+                vllm_tflops = _nominal_tflops(lat_vllm, batch, s_kv, s_q, h_q, d_qk)
+                tle_tflops = _nominal_tflops(lat_tle, batch, s_kv, s_q, h_q, d_qk)
+                rows.append(f"{batch:6d}  {_human_int(s_kv):>8}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
+                            f"{vals[5]}  {vals[6]}  {vals[7]}  "
+                            f"{format_tflops(vllm_tflops)}  {format_tflops(tle_tflops)}  "
+                            f"{ratios[0]}  {ratios[1]}  {ratios[2]}")
+            else:
+                rows.append(f"{batch:6d}  {s_kv:6d}  {s_q:4d}  {h_q:4d}  {d_qk:4d}  "
+                            f"{vals[5]}  {vals[6]}  {vals[7]}  "
+                            f"{ratios[0]}  {ratios[1]}  {ratios[2]}")
 
     print()
     _print_table(header, rows)
